@@ -1,0 +1,126 @@
+import asyncio
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="fastapi._compat.v1")
+
+from google.adk.agents import LlmAgent, SequentialAgent, ParallelAgent
+from google.adk.sessions import Session, BaseSessionService
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.agents.run_config import RunConfig
+
+
+# ---------------- Local Session Service ----------------
+class LocalSessionService(BaseSessionService):
+    async def save_session(self, session): return session
+    async def get_session(self, session_id): return None
+    async def delete_session(self, session_id): return None
+    async def create_session(self, session): return session
+    async def list_sessions(self, filter=None): return []
+
+
+# ---------------- Define Base Agents ----------------
+eligibility_agent = LlmAgent(
+    name="EligibilityAgent",
+    model="gemini-2.0-flash",
+    instruction="You assess loan eligibility. Output clearly: 'Eligible - reason' or 'Not Eligible - reason'.",
+    output_key="eligibility_result",
+)
+
+risk_agent = LlmAgent(
+    name="RiskAgent",
+    model="gemini-2.0-flash",
+    instruction="You assess risk as 'Low', 'Medium', or 'High' with one reason.",
+    output_key="risk_result",
+)
+
+interest_agent = LlmAgent(
+    name="InterestAgent",
+    model="gemini-2.0-flash",
+    instruction="You suggest a suitable interest rate (%) based on risk and eligibility.",
+    output_key="interest_result",
+)
+
+parallel_analysis = ParallelAgent(
+    name="ParallelAnalysis",
+    sub_agents=[eligibility_agent, risk_agent, interest_agent],
+)
+
+decision_agent = LlmAgent(
+    name="DecisionAgent",
+    model="gemini-2.0-flash",
+    instruction=(
+        "You are the final loan officer.\n"
+        "Eligibility: {eligibility_result}\n"
+        "Risk: {risk_result}\n"
+        "Interest: {interest_result}\n\n"
+        "Give a single-line final decision ('Approved', 'Rejected', or 'Needs Review') with a short reason."
+    ),
+)
+
+loan_workflow = SequentialAgent(
+    name="BankLoanWorkflow",
+    sub_agents=[parallel_analysis, decision_agent],
+)
+
+
+# ---------------- Main Runner ----------------
+async def main():
+    print("🏦 Parallel Banking Multi-Agent System Started...\n")
+
+    name = input("Applicant Name: ")
+    age = input("Age: ")
+    income = input("Annual Income (₹): ")
+    amount = input("Loan Amount Requested (₹): ")
+    history = input("Credit History Summary: ")
+
+    user_info = f"Name: {name}, Age: {age}, Income: ₹{income}, Loan: ₹{amount}, Credit: {history}"
+
+    session = Session(id="loan-session-001", appName="BankParallelSystem", userId=name)
+    session_service = LocalSessionService()
+    run_config = RunConfig(response_modalities=["TEXT"])
+
+    ctx = InvocationContext(
+        session=session,
+        session_service=session_service,
+        invocation_id="loan-run-001",
+        agent=loan_workflow,
+        run_config=run_config,
+    )
+
+    for agent in [eligibility_agent, risk_agent, interest_agent, decision_agent]:
+        agent.instruction += f"\n\nApplicant Info:\n{user_info}"
+
+    print("\n🧩 Running parallel analysis + decision...\n")
+
+    async for event in loan_workflow.run_async(parent_context=ctx):
+        if hasattr(event, "content") and getattr(event, "content", None):
+            for part in getattr(event.content, "parts", []):
+                if hasattr(part, "text") and part.text:
+                    author = getattr(event, "author", "UnknownAgent")
+                    text = part.text.strip()
+                    print(f"🤖 {author}: {text}")
+
+                    # ✅ Capture outputs into context manually
+                    if "EligibilityAgent" in author:
+                        ctx.session.state["eligibility_result"] = text
+                    elif "RiskAgent" in author:
+                        ctx.session.state["risk_result"] = text
+                    elif "InterestAgent" in author:
+                        ctx.session.state["interest_result"] = text
+                    elif "DecisionAgent" in author:
+                        ctx.session.state["final_decision"] = text
+
+    # ✅ Ensure all placeholders exist
+    for key in ["eligibility_result", "risk_result", "interest_result"]:
+        if key not in ctx.session.state:
+            ctx.session.state[key] = "N/A"
+
+    print("\n📊 Final Shared State:")
+    for k, v in ctx.session.state.items():
+        print(f"  {k}: {v}")
+
+    print("\n✅ Loan Evaluation Completed.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
