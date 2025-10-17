@@ -1,0 +1,152 @@
+import asyncio
+import re
+import warnings
+import copy
+
+warnings.filterwarnings("ignore", category=UserWarning, module="fastapi._compat.v1")
+
+from google.adk.agents import LlmAgent, SequentialAgent
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.agents.run_config import RunConfig
+from google.adk.sessions import Session, BaseSessionService
+
+
+# ---------------- Local Session ----------------
+class LocalSessionService(BaseSessionService):
+    async def save_session(self, session): return session
+    async def get_session(self, session_id): return None
+    async def delete_session(self, session_id): return None
+    async def create_session(self, session): return session
+    async def list_sessions(self, filter=None): return []
+
+
+# ---------------- Define Base Agents ----------------
+def create_agents():
+    return {
+        "LoanAgent": LlmAgent(
+            name="LoanAgent",
+            model="gemini-2.0-flash",
+            instruction="You handle all loan, EMI, and banking-related issues. Respond concisely and professionally."
+        ),
+        "TechSupportAgent": LlmAgent(
+            name="TechSupportAgent",
+            model="gemini-2.0-flash",
+            instruction="You assist with laptop, system, and technical troubleshooting issues. Give clear, step-by-step guidance."
+        ),
+        "ComplaintAgent": LlmAgent(
+            name="ComplaintAgent",
+            model="gemini-2.0-flash",
+            instruction="You handle customer complaints politely and empathetically, offering next steps or escalation paths."
+        ),
+        "InfoAgent": LlmAgent(
+            name="InfoAgent",
+            model="gemini-2.0-flash",
+            instruction="You answer general knowledge questions clearly and briefly."
+        ),
+        "DecisionAgent": LlmAgent(
+            name="DecisionAgent",
+            model="gemini-2.0-flash",
+            instruction="You summarize and give a final decision based on the results of other agents. Keep it one line."
+        ),
+        "RouterAgent": LlmAgent(
+            name="RouterAgent",
+            model="gemini-2.0-flash",
+            instruction=(
+                "You are a routing AI that decides which agents should handle a user's query.\n"
+                "Available agents:\n"
+                "- LoanAgent (finance, EMI, banking)\n"
+                "- TechSupportAgent (technical issues, laptop, systems)\n"
+                "- ComplaintAgent (complaints, customer service)\n"
+                "- InfoAgent (general information)\n"
+                "- DecisionAgent (final summarization)\n\n"
+                "Output only in this format:\n"
+                "ROUTE: Agent1 -> Agent2 -> Agent3\n\n"
+                "Always end with DecisionAgent unless it’s a general query."
+            ),
+        )
+    }
+
+
+# ---------------- Helper: Parse Route ----------------
+def parse_route(text, agent_map):
+    # In case Gemini outputs multiple routes, keep only the last valid one
+    matches = re.findall(r"ROUTE:\s*(.*)", text)
+    if not matches:
+        return []
+    last_route = matches[-1]
+    sequence = [a.strip() for a in last_route.split("->")]
+    return [copy.deepcopy(agent_map[a]) for a in sequence if a in agent_map]
+
+
+# ---------------- Run Agents ----------------
+async def run_agents(agent_sequence, user_input, ctx):
+    if not agent_sequence:
+        print("⚠️ No valid route found. Defaulting  to InfoAgent.")
+        agent_sequence = [copy.deepcopy(agent_map["InfoAgent"])]
+
+    print(f"\n🧭 Routing through: {' → '.join([a.name for a in agent_sequence])}\n")
+
+    # Append user input into each cloned agent’s instruction
+    for agent in agent_sequence:
+        agent.instruction += f"\n\nUser said: {user_input}"
+
+    flow = SequentialAgent(name="SmartFlow", sub_agents=agent_sequence)
+
+    async for event in flow.run_async(parent_context=ctx):
+        if hasattr(event, "content") and getattr(event, "content", None):
+            for part in getattr(event.content, "parts", []):
+                if hasattr(part, "text") and part.text:
+                    print(f"🤖 {event.author}: {part.text.strip()}")
+
+
+# ---------------- Main ----------------
+async def main():
+    print("🧠 Self-Learning Adaptive Multi-Agent System Started...\n")
+
+    global agent_map
+    agent_map = create_agents()
+    router_agent = agent_map["RouterAgent"]
+
+    session = Session(id="ai-router-001", appName="SelfLearningRouter", userId="harman")
+    session_service = LocalSessionService()
+    run_config = RunConfig(response_modalities=["TEXT"])
+
+    ctx = InvocationContext(
+        session=session,
+        session_service=session_service,
+        invocation_id="adaptive-router-001",
+        agent=router_agent,
+        run_config=run_config
+    )
+
+    while True:
+        user_input = input("\n💬 Describe a situation (or type 'exit' to quit): ")
+        if user_input.lower() == "exit":
+            print("\n👋 Exiting system. Goodbye!")
+            break
+
+        print("\n🧩 Thinking which agents to use...\n")
+
+        routing_text = ""
+
+        # Clone router agent to avoid reuse conflicts
+        temp_router = copy.deepcopy(router_agent)
+        temp_router.instruction += f"\n\nUser said: {user_input}"
+
+        async for event in temp_router.run_async(parent_context=ctx):
+            if hasattr(event, "content") and getattr(event, "content", None):
+                for part in getattr(event.content, "parts", []):
+                    if hasattr(part, "text") and part.text:
+                        routing_text += part.text.strip()
+
+        print(f"🧭 Router decided: {routing_text}")
+
+        route = parse_route(routing_text, agent_map)
+        await run_agents(route, user_input, ctx)
+
+        print("\n✅ Task completed.\n" + "-" * 60)
+
+
+# ---------------- Run ----------------
+if __name__ == "__main__":
+    asyncio.run(main())
